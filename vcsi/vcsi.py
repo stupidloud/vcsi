@@ -304,6 +304,7 @@ class MediaInfo(object):
 
         self.size_bytes = int(format_dict["size"])
         self.size = self.human_readable_size(self.size_bytes)
+        self.overall_bit_rate = int(format_dict["bit_rate"])
 
     @staticmethod
     def pretty_to_seconds(
@@ -384,12 +385,15 @@ class MediaInfo(object):
             "millis": millis
         }
 
-    def desired_size(self, width=Config.contact_sheet_width):
+    def desired_size(self, width=Config.contact_sheet_width, vr_mode=False):
         """Computes the height based on a given width and fixed aspect ratio.
         Returns (width, height)
         """
         ratio = width / float(self.display_width)
-        desired_height = int(math.floor(self.display_height * ratio))
+        if vr_mode:
+            desired_height = width
+        else:
+            desired_height = int(math.floor(self.display_height * ratio))
         return (width, desired_height)
 
     def parse_attributes(self):
@@ -455,7 +459,7 @@ class MediaInfo(object):
         try:
             self.audio_bit_rate = int(self.audio_stream["bit_rate"])
         except (KeyError, AttributeError):
-            self.audio_bit_rate = None
+            self.audio_bit_rate = 256
 
     def template_attributes(self):
         """Returns the template attributes and values ready for use in the metadata header
@@ -487,6 +491,7 @@ class MediaInfo(object):
         table.append({"name": "audio_sample_rate", "description": "Audio sample rate (Hz)", "example": "44100"})
         table.append({"name": "audio_bit_rate", "description": "Audio bit rate (bits/s)", "example": "192000"})
         table.append({"name": "frame_rate", "description": "Frame rate (frames/s)", "example": "23.974"})
+        table.append({"name": "overall_bit_rate", "description": "over_bit_rate", "example": 6000000})
         return table
 
 
@@ -501,10 +506,11 @@ class MediaCapture(object):
         self.skip_delay_seconds = skip_delay_seconds
         self.frame_type = frame_type
 
-    def make_capture(self, time, width, height, out_path="out.png"):
+    def make_capture(self, time, width, height, out_path="out.png", vr_mode=False):
         """Capture a frame at given time with given width and height using ffmpeg
         """
         skip_delay = MediaInfo.pretty_duration(self.skip_delay_seconds, show_millis=True)
+        filters = []
 
         ffmpeg_command = [
             "ffmpeg",
@@ -514,18 +520,21 @@ class MediaCapture(object):
             "-s", "%sx%s" % (width, height),
         ]
 
+        # 添加帧类型过滤器
         if self.frame_type is not None:
-            select_args = [
-                "-vf", "select='eq(frame_type\\," + self.frame_type + ")'"
-            ]
+            if self.frame_type == "key":
+                filters.append("select=key")
+            else:
+                filters.append("select='eq(frame_type\\," + self.frame_type + ")'")
 
-        if self.frame_type == "key":
-            select_args = [
-                "-vf", "select=key"
-            ]
+        # 添加VR模式过滤器
+        if vr_mode:
+            filters.append("v360=input=hequirect:output=flat:h_fov=100:v_fov=100:in_stereo=sbs")
 
-        if self.frame_type is not None:
-            ffmpeg_command += select_args
+        # 如果有过滤器，将其添加到命令中
+        if filters:
+            filter_string = ",".join(filters)
+            ffmpeg_command += ["-vf", filter_string]
 
         ffmpeg_command += [
             "-y",
@@ -545,8 +554,10 @@ class MediaCapture(object):
                     "-s", "%sx%s" % (width, height),
                 ]
 
-                if self.frame_type is not None:
-                    ffmpeg_command += select_args
+                # 如果有过滤器，将其添加到命令中
+                if filters:
+                    filter_string = ",".join(filters)
+                    ffmpeg_command += ["-vf", filter_string]
 
                 ffmpeg_command += [
                     "-y",
@@ -563,8 +574,10 @@ class MediaCapture(object):
                     "-s", "%sx%s" % (width, height),
                 ]
 
-                if self.frame_type is not None:
-                    ffmpeg_command += select_args
+                # 如果有过滤器，将其添加到命令中
+                if filters:
+                    filter_string = ",".join(filters)
+                    ffmpeg_command += ["-vf", filter_string]
 
                 ffmpeg_command += [
                     "-y",
@@ -637,14 +650,15 @@ def grid_desired_size(
         grid,
         media_info,
         width=Config.contact_sheet_width,
-        horizontal_margin=Config.grid_horizontal_spacing):
+        horizontal_margin=Config.grid_horizontal_spacing,
+        vr_mode=False):
     """Computes the size of the images placed on a mxn grid with given fixed width.
     Returns (width, height)
     """
     desired_width = (width - (grid.x - 1) * horizontal_margin) / grid.x
     desired_width = int(math.floor(desired_width))
 
-    return media_info.desired_size(width=desired_width)
+    return media_info.desired_size(width=desired_width, vr_mode=vr_mode)
 
 
 def total_delay_seconds(media_info, args):
@@ -686,7 +700,8 @@ def select_sharpest_images(
         args.grid,
         media_info,
         width=args.vcs_width,
-        horizontal_margin=args.grid_horizontal_spacing)
+        horizontal_margin=args.grid_horizontal_spacing,
+        vr_mode=args.vr_mode)
 
     if args.manual_timestamps is None:
         timestamps = timestamp_generator(media_info, args)
@@ -696,7 +711,7 @@ def select_sharpest_images(
     def do_capture(ts_tuple, width, height, suffix, args):
         fd, filename = tempfile.mkstemp(suffix=suffix)
 
-        media_capture.make_capture(ts_tuple[1], width, height, filename)
+        media_capture.make_capture(ts_tuple[1], width, height, filename, args.vr_mode)
 
         blurriness = 1
         avg_color = 0
@@ -965,7 +980,8 @@ def compose_contact_sheet(
         args.grid,
         media_info,
         width=args.vcs_width,
-        horizontal_margin=args.grid_horizontal_spacing)
+        horizontal_margin=args.grid_horizontal_spacing,
+        vr_mode=args.vr_mode)
     width = args.grid.x * (desired_size[0] + args.grid_horizontal_spacing) - args.grid_horizontal_spacing
     height = args.grid.y * (desired_size[1] + args.grid_vertical_spacing) - args.grid_vertical_spacing
 
@@ -1453,6 +1469,11 @@ def main():
         action="store_true",
         help="display verbose messages",
         dest="is_verbose")
+    parser.add_argument(
+        "--vr",
+        action="store_true",
+        help="vr mode",
+        dest="vr_mode")
     parser.add_argument(
         "-a", "--accurate",
         action="store_true",
