@@ -1671,9 +1671,6 @@ def main():
 def process_file(path, args):
     """Generate a video contact sheet for the file at given path
     """
-    # 记录开始时间
-    start_time = time.time()
-
     if args.is_verbose:
         print("Considering {}...".format(path))
 
@@ -1717,8 +1714,6 @@ def process_file(path, args):
 
     args.num_groups = 5
 
-    # 开始媒体信息分析
-    media_info_start = time.time()
     media_info = MediaInfo(
         path,
         verbose=args.is_verbose)
@@ -1728,8 +1723,6 @@ def process_file(path, args):
         skip_delay_seconds=args.accurate_delay_seconds,
         frame_type=args.frame_type
     )
-    media_info_time = time.time() - media_info_start
-    print("Media info analysis time: {:.2f} seconds".format(media_info_time))
 
     # metadata margins
     if not args.metadata_margin == DEFAULT_METADATA_MARGIN:
