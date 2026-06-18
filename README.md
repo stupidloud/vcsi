@@ -392,3 +392,101 @@ To test Github Actions locally using [act](https://github.com/nektos/act):
 ```
 act push
 ```
+
+---
+
+## 中文安装说明（PyAV 后端版本）
+
+本 fork 把帧抓取/元数据探测从 `ffmpeg` / `ffprobe` 子进程切换为 [PyAV](https://pyav.org/)（FFmpeg 的 Python 绑定）。对一次生成 contact sheet 的工作流来说，整批采样只打开一次容器、复用解码器，能消除"每个采样点 fork 一次 ffmpeg 进程"的开销。在 4K VP9 测试上，相同参数下大致比原版快 **1.5×～2.1×**，样本越多收益越明显。
+
+### 1. 系统依赖
+
+**不再需要在系统里装 `ffmpeg` 或 `ffprobe`。** PyAV 的 wheel 自带 FFmpeg 共享库。
+
+- **常见 Linux（Ubuntu / Debian / CentOS / Rocky / Amazon Linux 2+，含 x86_64 与 aarch64）**：直接装即可。
+- **macOS / Windows**：直接装即可。
+- **Alpine / musl 容器**：若 PyPI 上没有合适的 `musllinux` wheel，要么换 `python:3.x-slim` 基础镜像，要么源码编译：
+  ```bash
+  apk add --no-cache build-base pkgconfig ffmpeg-dev
+  pip install av --no-binary av
+  ```
+- **想用 GPU 硬解**：宿主机要装好 NVIDIA 驱动 / VAAPI 驱动，容器加 `--gpus all`（CUDA）或 `--device /dev/dri`（VAAPI）。PyAV 本身**不**需要额外的 CUDA Toolkit。
+
+### 2. 安装
+
+推荐用 [uv](https://github.com/astral-sh/uv) 管理虚拟环境：
+
+```bash
+git clone https://github.com/stupidloud/vcsi.git
+cd vcsi
+uv sync
+uv run vcsi --help
+```
+
+也可以用纯 pip：
+
+```bash
+git clone https://github.com/stupidloud/vcsi.git
+cd vcsi
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+vcsi --help
+```
+
+验证 PyAV 与捆绑的 FFmpeg 版本：
+
+```bash
+python -c "import av; print(av.__version__, av.library_versions)"
+```
+
+### 3. 启用硬件解码
+
+CLI 新增两个参数，默认走纯软件解码：
+
+| 参数 | 说明 |
+|---|---|
+| `--hwaccel TYPE` | 传给 PyAV 的 `device_type`，例如 `cuda`、`qsv`、`vaapi`、`drm`、`d3d11va`、`videotoolbox`、`amf` |
+| `--hwaccel-device VALUE` | 可选的设备索引或路径，例如 `0`（CUDA 第 0 张卡）或 `/dev/dri/renderD128`（VAAPI） |
+
+查看当前 PyAV wheel 编入了哪些硬解设备：
+
+```bash
+python -c "import av.codec.hwaccel as h; print(h.hwdevices_available())"
+```
+
+用法示例：
+
+```bash
+# NVIDIA CUDA / NVDEC
+vcsi video.mp4 --hwaccel cuda --hwaccel-device 0
+
+# Intel VAAPI
+vcsi video.mp4 --hwaccel vaapi --hwaccel-device /dev/dri/renderD128
+
+# macOS VideoToolbox
+vcsi video.mp4 --hwaccel videotoolbox
+```
+
+如果硬解设备初始化失败（驱动缺失、容器未透传 GPU 等），程序会直接报错；这是预期行为——硬解是显式开启的优化项，不做静默回退。
+
+### 4. 行为差异 / 注意事项
+
+- **没有临时文件**：原版每一帧写成 PNG/JPG 暂存到 `/tmp` 再读回；新版全程在内存里以 `PIL.Image` 流转。
+- **`--frame-type`** 仍支持 `I` / `P` / `B` / `key`；其中 `key` 与 `I` 表现最稳定，是推荐用法。
+- **VR 模式（`--vr`）** 通过 PyAV filter graph 调用 ffmpeg 的 `v360` 滤镜，对应 PyAV wheel 内置的 libavfilter 必须开了 `v360`（PyPI 主流 wheel 都开了，无需额外操作）。
+- **`-f`/`--fast`** 仍跳过 blur/avg-color 计算，但不再启用多进程并行——PyAV 后端整批共用一个解码器，多进程并行没意义。
+
+### 5. 性能参考
+
+测试机：WSL2 + /mnt/d（Windows NTFS 挂载，I/O 是主要瓶颈）。视频：2:40:03 长、3840×2160、VP9。
+
+| 场景 | 原版 (ffmpeg CLI) | 本 fork (PyAV) | 加速 |
+|---|---:|---:|---:|
+| `-g 3x3` | 12.99s | 7.11s | 1.83× |
+| `-g 3x3 -a` | 14.25s | 8.90s | 1.60× |
+| `-g 3x3 --frame-type key` | 16.16s | 7.65s | 2.11× |
+| `-g 3x3 -s 30` | 32.67s | 15.50s | 2.11× |
+| `-g 0x0 --interval 5m` | 23.66s | 14.64s | 1.62× |
+| `-g 4x4 -s 60` | 53.56s | 30.39s | 1.76× |
+
+样本越多，差距越大。本地原生文件系统 + 开 GPU 硬解的场景上预期会再拉大。

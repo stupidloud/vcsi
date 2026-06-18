@@ -7,30 +7,25 @@ from __future__ import print_function
 
 import datetime
 import os
-import shutil
-import subprocess
 import sys
 from argparse import ArgumentTypeError
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from typing import List, Iterable
 from urllib.parse import urlparse
 
-try:
-    from subprocess import DEVNULL
-except ImportError:
-    DEVNULL = open(os.devnull, 'wb')
 import argparse
 import configparser
-import json
 import math
-import tempfile
 import textwrap
 from collections import namedtuple
 from enum import Enum
+from fractions import Fraction
 from glob import glob
 from glob import escape
 
+import av
+from av.codec.hwaccel import HWAccel
+from av.filter import Graph
 from PIL import Image, ImageDraw, ImageFont
 import numpy
 from jinja2 import Template
@@ -50,7 +45,8 @@ class Grid(namedtuple('Grid', ['x', 'y'])):
         return "%sx%s" % (self.x, self.y)
 
 
-class Frame(namedtuple('Frame', ['filename', 'blurriness', 'timestamp', 'avg_color'])):
+class Frame(namedtuple('Frame', ['image', 'blurriness', 'timestamp', 'avg_color'])):
+    """A captured frame held in memory as a PIL.Image."""
     pass
 
 
@@ -117,6 +113,8 @@ DEFAULT_IMAGE_FORMAT = "jpg"
 DEFAULT_TIMESTAMP_POSITION = TimestampPosition.se
 DEFAULT_FRAME_TYPE = None
 DEFAULT_INTERVAL = None
+DEFAULT_HWACCEL = None
+DEFAULT_HWACCEL_DEVICE = None
 
 
 class Config:
@@ -154,6 +152,8 @@ class Config:
     timestamp_position = DEFAULT_TIMESTAMP_POSITION
     frame_type = DEFAULT_FRAME_TYPE
     interval = DEFAULT_INTERVAL
+    hwaccel = DEFAULT_HWACCEL
+    hwaccel_device = DEFAULT_HWACCEL_DEVICE
 
     @classmethod
     def load_configuration(cls, filename=DEFAULT_CONFIG_FILE):
@@ -177,16 +177,23 @@ class Config:
 
 
 class MediaInfo(object):
-    """Collect information about a video file
+    """Collect information about a video file using PyAV (libav* bindings).
     """
 
     def __init__(self, path, verbose=False):
-        self.probe_media(path)
-        self.find_video_stream()
-        self.find_audio_stream()
-        self.compute_display_resolution()
-        self.compute_format()
-        self.parse_attributes()
+        self.file_path = os.path.abspath(path)
+        self.filename = os.path.basename(path)
+        try:
+            self.size_bytes = os.path.getsize(self.file_path)
+        except OSError:
+            self.size_bytes = 0
+        self.size = self.human_readable_size(self.size_bytes)
+
+        try:
+            with av.open(path) as container:
+                self._extract(container)
+        except av.FFmpegError as ex:
+            error_exit("Could not open '%s' with PyAV: %s" % (path, ex))
 
         if verbose:
             print(self.filename)
@@ -195,25 +202,133 @@ class MediaInfo(object):
             print(self.duration)
             print(self.size)
 
-    def probe_media(self, path):
-        """Probe video file using ffprobe
-        """
-        ffprobe_command = [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            "--",
-            path
-        ]
+    def _extract(self, container):
+        # overall duration / bit rate from the container, with stream fallback below
+        if container.duration is not None:
+            self.duration_seconds = container.duration / float(av.time_base)
+        else:
+            self.duration_seconds = 0.0
+        self.overall_bit_rate = int(container.bit_rate or 0)
 
+        v_streams = [s for s in container.streams if s.type == 'video']
+        a_streams = [s for s in container.streams if s.type == 'audio']
+
+        if v_streams:
+            self._extract_video(v_streams[0])
+        else:
+            self.video_codec = None
+            self.video_codec_long = None
+            self.video_bit_rate = None
+            self.sample_aspect_ratio = None
+            self.display_aspect_ratio = None
+            self.frame_rate = None
+            self.sample_width = self.sample_height = 0
+            self.display_width = self.display_height = 0
+
+        if a_streams:
+            self._extract_audio(a_streams[0])
+        else:
+            self.audio_codec = None
+            self.audio_codec_long = None
+            self.audio_sample_rate = None
+            self.audio_bit_rate = 256
+
+        # cosmetic
+        self.duration = MediaInfo.pretty_duration(self.duration_seconds)
+
+        if self.display_width == 0:
+            self.display_width = self.sample_width
+        if self.display_height == 0:
+            self.display_height = self.sample_height
+
+    def _extract_video(self, stream):
+        cc = stream.codec_context
+        codec = cc.codec if cc else None
+        self.video_codec = codec.name if codec else None
+        self.video_codec_long = codec.long_name if codec else None
+        self.video_bit_rate = int(stream.bit_rate) if stream.bit_rate else None
+
+        # Prefer the video stream's own duration when available
+        if stream.duration and stream.time_base:
+            stream_secs = float(stream.duration * stream.time_base)
+            if stream_secs > 0:
+                self.duration_seconds = stream_secs
+
+        self.sample_width = int(cc.width) if cc and cc.width else 0
+        self.sample_height = int(cc.height) if cc and cc.height else 0
+
+        rotation = self._read_rotation(stream)
+        if rotation in (90, 270):
+            self.sample_width, self.sample_height = self.sample_height, self.sample_width
+
+        sar = cc.sample_aspect_ratio if cc else None
+        if (sar is not None and sar.numerator and sar.denominator
+                and sar.numerator != sar.denominator):
+            self.sample_aspect_ratio = "%d:%d" % (sar.numerator, sar.denominator)
+            self.display_width = int(self.sample_width * sar.numerator / sar.denominator)
+            self.display_height = self.sample_height
+        else:
+            self.sample_aspect_ratio = (
+                "%d:%d" % (sar.numerator, sar.denominator) if sar else "1:1"
+            )
+            self.display_width = self.sample_width
+            self.display_height = self.sample_height
+
+        dar = cc.display_aspect_ratio if cc else None
+        if dar is not None and dar.numerator and dar.denominator:
+            self.display_aspect_ratio = "%d:%d" % (dar.numerator, dar.denominator)
+        else:
+            self.display_aspect_ratio = None
+
+        rate = stream.average_rate or stream.guessed_rate
+        if rate and rate.denominator:
+            try:
+                self.frame_rate = round(float(rate), 3)
+            except (ValueError, ZeroDivisionError):
+                self.frame_rate = None
+        else:
+            self.frame_rate = None
+
+    def _extract_audio(self, stream):
+        cc = stream.codec_context
+        codec = cc.codec if cc else None
+        self.audio_codec = codec.name if codec else None
+        self.audio_codec_long = codec.long_name if codec else None
+        self.audio_sample_rate = int(cc.sample_rate) if cc and cc.sample_rate else None
+        self.audio_bit_rate = int(stream.bit_rate) if stream.bit_rate else 256
+
+    @staticmethod
+    def _read_rotation(stream):
+        """Return rotation in {0,90,180,270} or 0 if unknown."""
+        rotation = 0
         try:
-            output = subprocess.check_output(ffprobe_command)
-            self.ffprobe_dict = json.loads(output.decode("utf-8"))
-        except FileNotFoundError:
-            error = "Could not find 'ffprobe' executable. Please make sure ffmpeg/ffprobe is installed and is in your PATH."
-            error_exit(error)
+            rotate_meta = stream.metadata.get('rotate')
+            if rotate_meta is not None:
+                rotation = int(rotate_meta) % 360
+        except (ValueError, TypeError, AttributeError):
+            rotation = 0
+
+        if rotation == 0:
+            try:
+                for sd in stream.side_data:
+                    sd_type = getattr(sd, 'type', None)
+                    name = getattr(sd_type, 'name', str(sd_type)) if sd_type else ''
+                    if 'DISPLAYMATRIX' in name.upper() or 'DISPLAY_MATRIX' in name.upper():
+                        deg = getattr(sd, 'rotation', None)
+                        if deg is None and hasattr(sd, 'to_ndarray'):
+                            # As a last resort try to parse from the matrix itself
+                            continue
+                        if deg is not None:
+                            rotation = int(round(float(deg))) % 360
+                            if rotation < 0:
+                                rotation += 360
+                        break
+            except (AttributeError, TypeError):
+                pass
+
+        if rotation not in (0, 90, 180, 270):
+            rotation = 0
+        return rotation
 
     def human_readable_size(self, num, suffix='B'):
         """Converts a number of bytes to a human readable format
@@ -223,106 +338,6 @@ class MediaInfo(object):
                 return "%3.1f %s%s" % (num, unit, suffix)
             num /= 1024.0
         return "%.1f %s%s" % (num, 'Yi', suffix)
-
-    def find_video_stream(self):
-        """Find the first stream which is a video stream
-        """
-        for stream in self.ffprobe_dict["streams"]:
-            try:
-                if stream["codec_type"] == "video":
-                    self.video_stream = stream
-                    break
-            except:
-                pass
-
-    def find_audio_stream(self):
-        """Find the first stream which is an audio stream
-        """
-        for stream in self.ffprobe_dict["streams"]:
-            try:
-                if stream["codec_type"] == "audio":
-                    self.audio_stream = stream
-                    break
-            except:
-                pass
-
-    def compute_display_resolution(self):
-        """Computes the display resolution.
-        Some videos have a sample resolution that differs from the display resolution
-        (non-square pixels), thus the proper display resolution has to be computed.
-        """
-        self.sample_width = int(self.video_stream["width"])
-        self.sample_height = int(self.video_stream["height"])
-
-        # videos recorded with a smartphone may have a "rotate" flag
-        try:
-            # Try to get rotation from the original key
-            rotation = int(self.video_stream["tags"]["rotate"])
-        except KeyError:
-            # If the original key is not present, check the  key for newer iPhones 14+ (iOS 17+)
-            side_data_list = self.video_stream.get("side_data_list", [])
-            rotation = None
-
-            for side_data in side_data_list:
-                if side_data.get("side_data_type") == "Display Matrix":
-                    # Extract rotation value
-                    rotation_value = side_data.get("rotation")
-                    if rotation_value is not None:
-                        # Normalize the rotation value to ensure it is either 90, 180, 270, or None
-                        rotation = int(rotation_value) % 360
-                        if rotation < 0:
-                            rotation += 360
-                        if rotation not in [0, 90, 180, 270]:
-                            rotation = None
-                        break
-
-        if rotation in [90, 270]:
-            # swap width and height
-            self.sample_width, self.sample_height = self.sample_height, self.sample_width
-
-        sample_aspect_ratio = "1:1"
-        try:
-            sample_aspect_ratio = self.video_stream["sample_aspect_ratio"]
-        except KeyError:
-            pass
-
-        if sample_aspect_ratio == "1:1":
-            self.display_width = self.sample_width
-            self.display_height = self.sample_height
-        else:
-            sample_split = sample_aspect_ratio.split(":")
-            sw = int(sample_split[0])
-            sh = int(sample_split[1])
-
-            self.display_width = int(self.sample_width * sw / sh)
-            self.display_height = int(self.sample_height)
-
-        if self.display_width == 0:
-            self.display_width = self.sample_width
-
-        if self.display_height == 0:
-            self.display_height = self.sample_height
-
-    def compute_format(self):
-        """Compute duration, size and retrieve filename
-        """
-        format_dict = self.ffprobe_dict["format"]
-
-        try:
-            # try getting video stream duration first
-            self.duration_seconds = float(self.video_stream["duration"])
-        except (KeyError, AttributeError):
-            # otherwise fallback to format duration
-            self.duration_seconds = float(format_dict["duration"])
-
-        self.duration = MediaInfo.pretty_duration(self.duration_seconds)
-
-        self.filename = os.path.basename(format_dict["filename"])
-        self.file_path = os.path.abspath(format_dict["filename"])
-
-        self.size_bytes = int(format_dict["size"])
-        self.size = self.human_readable_size(self.size_bytes)
-        self.overall_bit_rate = int(format_dict["bit_rate"])
 
     @staticmethod
     def pretty_to_seconds(
@@ -414,71 +429,6 @@ class MediaInfo(object):
             desired_height = int(math.floor(self.display_height * ratio))
         return (width, desired_height)
 
-    def parse_attributes(self):
-        """Parse multiple media attributes
-        """
-        # video
-        try:
-            self.video_codec = self.video_stream["codec_name"]
-        except KeyError:
-            self.video_codec = None
-
-        try:
-            self.video_codec_long = self.video_stream["codec_long_name"]
-        except KeyError:
-            self.video_codec_long = None
-
-        try:
-            self.video_bit_rate = int(self.video_stream["bit_rate"])
-        except KeyError:
-            self.video_bit_rate = None
-
-        try:
-            self.sample_aspect_ratio = self.video_stream["sample_aspect_ratio"]
-        except KeyError:
-            self.sample_aspect_ratio = None
-
-        try:
-            self.display_aspect_ratio = self.video_stream["display_aspect_ratio"]
-        except KeyError:
-            self.display_aspect_ratio = None
-
-        try:
-            self.frame_rate = self.video_stream["avg_frame_rate"]
-            splits = self.frame_rate.split("/")
-
-            if len(splits) == 2:
-                self.frame_rate = int(splits[0]) / int(splits[1])
-            else:
-                self.frame_rate = int(self.frame_rate)
-
-            self.frame_rate = round(self.frame_rate, 3)
-        except KeyError:
-            self.frame_rate = None
-        except ZeroDivisionError:
-            self.frame_rate = None
-
-        # audio
-        try:
-            self.audio_codec = self.audio_stream["codec_name"]
-        except (KeyError, AttributeError):
-            self.audio_codec = None
-
-        try:
-            self.audio_codec_long = self.audio_stream["codec_long_name"]
-        except (KeyError, AttributeError):
-            self.audio_codec_long = None
-
-        try:
-            self.audio_sample_rate = int(self.audio_stream["sample_rate"])
-        except (KeyError, AttributeError):
-            self.audio_sample_rate = None
-
-        try:
-            self.audio_bit_rate = int(self.audio_stream["bit_rate"])
-        except (KeyError, AttributeError):
-            self.audio_bit_rate = 256
-
     def template_attributes(self):
         """Returns the template attributes and values ready for use in the metadata header
         """
@@ -515,163 +465,159 @@ class MediaInfo(object):
 
 
 class MediaCapture(object):
-    """Capture frames of a video
+    """Capture frames from a video using PyAV.
+
+    One container is opened per ``iter_captures``/``make_captures`` call and
+    reused across every requested timestamp, so capturing N frames costs one
+    decoder init, N seeks, and the corresponding decode windows.
     """
 
     def __init__(self, path, accurate=False, skip_delay_seconds=Config.accurate_delay_seconds,
-                 frame_type=Config.frame_type):
+                 frame_type=Config.frame_type, hwaccel=None, hwaccel_device=None):
         self.path = path
         self.accurate = accurate
         self.skip_delay_seconds = skip_delay_seconds
         self.frame_type = frame_type
+        self.hwaccel = hwaccel
+        self.hwaccel_device = hwaccel_device
 
-    def make_capture(self, time, width, height, out_path="out.png", vr_mode=False):
-        """Capture a frame at given time with given width and height using ffmpeg
-        """
-        skip_delay = MediaInfo.pretty_duration(self.skip_delay_seconds, show_millis=True)
-        filters = []
+    # ---- container / hwaccel plumbing ----
 
-        ffmpeg_command = [
-            "ffmpeg",
-            "-ss", time,
-            "-i", self.path,
-            "-vframes", "1",
-            "-s", "%sx%s" % (width, height),
-        ]
-
-        # 添加帧类型过滤器
-        if self.frame_type is not None:
-            if self.frame_type == "key":
-                filters.append("select=key")
-            else:
-                filters.append("select='eq(frame_type\\," + self.frame_type + ")'")
-
-        # 添加VR模式过滤器
-        if vr_mode:
-            filters.append("v360=input=hequirect:output=flat:h_fov=100:v_fov=100:in_stereo=sbs")
-
-        # 如果有过滤器，将其添加到命令中
-        if filters:
-            filter_string = ",".join(filters)
-            ffmpeg_command += ["-vf", filter_string]
-
-        ffmpeg_command += [
-            "-y",
-            out_path
-        ]
-
-        if self.accurate:
-            time_seconds = MediaInfo.pretty_to_seconds(time)
-            skip_time_seconds = time_seconds - self.skip_delay_seconds
-
-            if skip_time_seconds < 0:
-                ffmpeg_command = [
-                    "ffmpeg",
-                    "-i", self.path,
-                    "-ss", time,
-                    "-vframes", "1",
-                    "-s", "%sx%s" % (width, height),
-                ]
-
-                # 如果有过滤器，将其添加到命令中
-                if filters:
-                    filter_string = ",".join(filters)
-                    ffmpeg_command += ["-vf", filter_string]
-
-                ffmpeg_command += [
-                    "-y",
-                    out_path
-                ]
-            else:
-                skip_time = MediaInfo.pretty_duration(skip_time_seconds, show_millis=True)
-                ffmpeg_command = [
-                    "ffmpeg",
-                    "-ss", skip_time,
-                    "-i", self.path,
-                    "-ss", skip_delay,
-                    "-vframes", "1",
-                    "-s", "%sx%s" % (width, height),
-                ]
-
-                # 如果有过滤器，将其添加到命令中
-                if filters:
-                    filter_string = ",".join(filters)
-                    ffmpeg_command += ["-vf", filter_string]
-
-                ffmpeg_command += [
-                    "-y",
-                    out_path
-                ]
-
+    def _open_container(self):
+        kwargs = {}
+        if self.hwaccel:
+            hw_kwargs = {"device_type": self.hwaccel, "allow_software_fallback": True}
+            if self.hwaccel_device is not None:
+                hw_kwargs["device"] = self.hwaccel_device
+            kwargs["hwaccel"] = HWAccel(**hw_kwargs)
         try:
-            subprocess.run(ffmpeg_command, stdin=DEVNULL, capture_output=True, check=True)
-        except FileNotFoundError:
-            error = "Could not find 'ffmpeg' executable. Please make sure ffmpeg/ffprobe is installed and is in your PATH."
-            error_exit(error)
-        except subprocess.CalledProcessError as ex:
-            error = f"""
-                ffmpeg had an error while decoding the file:",
-                Command: '{" ".join(ex.cmd)}',
-                Exit code: {ex.returncode},
-                Output: {ex.stderr.decode("utf-8")}
-                """
-            raise RuntimeError(error)
-            
+            return av.open(self.path, **kwargs)
+        except av.FFmpegError as ex:
+            raise RuntimeError(
+                "PyAV failed to open '%s': %s" % (self.path, ex)
+            )
 
-    def compute_avg_color(self, image_path):
-        """Computes the average color of an image
+    @staticmethod
+    def _build_vr_graph(stream):
+        graph = Graph()
+        src = graph.add_buffer(template=stream)
+        v360 = graph.add(
+            "v360",
+            "input=hequirect:output=flat:h_fov=100:v_fov=100:in_stereo=sbs",
+        )
+        sink = graph.add("buffersink")
+        src.link_to(v360)
+        v360.link_to(sink)
+        graph.configure()
+        return graph
+
+    @staticmethod
+    def _frame_matches_type(frame, frame_type):
+        if frame_type is None:
+            return True
+        if frame_type == "key":
+            return bool(frame.key_frame)
+        pict = getattr(frame, "pict_type", None)
+        name = getattr(pict, "name", str(pict) if pict is not None else "")
+        return name == frame_type
+
+    # ---- capture API ----
+
+    def iter_captures(self, timestamps, width, height, vr_mode=False):
+        """Yield ``(original_index, PIL.Image)`` for every timestamp.
+
+        Timestamps are decoded in ascending order so the demuxer makes a
+        single forward pass; the original index lets the caller restore the
+        input order without re-sorting.
         """
-        i = Image.open(image_path)
-        i = i.convert('P')
-        p = i.getcolors()
+        if not timestamps:
+            return
 
-        # compute avg color
-        total_count = 0
-        avg_color = 0
-        for count, color in p:
-            total_count += count
-            avg_color += count * color
+        indexed = sorted(enumerate(timestamps), key=lambda kv: kv[1])
 
-        avg_color /= total_count
+        with self._open_container() as container:
+            v_streams = [s for s in container.streams if s.type == "video"]
+            if not v_streams:
+                raise RuntimeError("No video stream in '%s'" % self.path)
+            stream = v_streams[0]
+            stream.thread_type = "AUTO"
 
-        return avg_color
+            graph = self._build_vr_graph(stream) if vr_mode else None
 
-    def compute_blurriness(self, image_path):
-        """Computes the blurriness of an image. Small value means less blurry.
-        """
-        i = Image.open(image_path)
-        i = i.convert('L')  # convert to grayscale
+            for orig_idx, ts in indexed:
+                frame = self._capture_one(container, stream, ts)
+                if vr_mode:
+                    graph.vpush(frame)
+                    frame = graph.vpull()
+                img = frame.to_image()
+                if img.size != (width, height):
+                    img = img.resize((width, height), Image.BILINEAR)
+                yield orig_idx, img
 
-        a = numpy.asarray(i)
-        b = abs(numpy.fft.rfft2(a))
-        max_freq = self.avg9x(b)
+    def make_captures(self, timestamps, width, height, vr_mode=False):
+        """Materialize captures as a list ordered by the input timestamps."""
+        out = [None] * len(timestamps)
+        for idx, img in self.iter_captures(timestamps, width, height, vr_mode):
+            out[idx] = img
+        return out
 
-        if max_freq != 0:
-            return 1 / max_freq
-        else:
-            return 1
+    def _capture_one(self, container, stream, ts):
+        seek_ts = ts - self.skip_delay_seconds if self.accurate else ts
+        if seek_ts < 0:
+            seek_ts = 0.0
 
-    def avg9x(self, matrix, percentage=0.05):
-        """Computes the median of the top n% highest values.
-        By default, takes the top 5%
-        """
-        xs = matrix.flatten()
-        srt = sorted(xs, reverse=True)
-        length = int(math.floor(percentage * len(srt)))
+        offset = int(seek_ts / stream.time_base)
+        container.seek(offset, stream=stream, backward=True, any_frame=False)
 
-        matrix_subset = srt[:length]
-        return numpy.median(matrix_subset)
+        target = None
+        for frame in container.decode(stream):
+            ftime = frame.time
+            if ftime is None:
+                continue
+            if ftime < ts:
+                if self._frame_matches_type(frame, self.frame_type):
+                    target = frame
+                continue
+            # at-or-past the requested timestamp
+            if self._frame_matches_type(frame, self.frame_type):
+                return frame
+            # past timestamp but type mismatch: keep last viable candidate
+            if target is None:
+                target = frame
 
-    def max_freq(self, matrix):
-        """Returns the maximum value in the matrix
-        """
-        m = 0
-        for row in matrix:
-            mx = max(row)
-            if mx > m:
-                m = mx
+        if target is None:
+            raise RuntimeError(
+                "Could not decode any frame at %.3fs in '%s'" % (ts, self.path)
+            )
+        return target
 
-        return m
+
+# ---- module-level frame analyzers (work on PIL.Image directly) ----
+
+def compute_avg_color(image):
+    """Computes the average color of a PIL.Image."""
+    i = image.convert("P")
+    p = i.getcolors()
+    total_count = 0
+    avg_color = 0
+    for count, color in p:
+        total_count += count
+        avg_color += count * color
+    return avg_color / total_count
+
+
+def compute_blurriness(image):
+    """Computes the blurriness of a PIL.Image. Smaller means less blurry."""
+    i = image.convert("L")
+    a = numpy.asarray(i)
+    b = abs(numpy.fft.rfft2(a))
+    xs = b.flatten()
+    srt = numpy.sort(xs)[::-1]
+    length = int(math.floor(0.05 * len(srt)))
+    if length == 0:
+        return 1
+    max_freq = numpy.median(srt[:length])
+    return 1 / max_freq if max_freq != 0 else 1
 
 
 def grid_desired_size(
@@ -732,65 +678,33 @@ def select_sharpest_images(
         vr_mode=args.vr_mode)
 
     if args.manual_timestamps is None:
-        timestamps = timestamp_generator(media_info, args)
+        timestamps = list(timestamp_generator(media_info, args))
     else:
         timestamps = [(MediaInfo.pretty_to_seconds(x), x) for x in args.manual_timestamps]
 
-    def do_capture(ts_tuple, width, height, suffix, args):
-        fd, filename = tempfile.mkstemp(suffix=suffix)
+    ts_seconds = [t[0] for t in timestamps]
+    total = len(timestamps)
 
-        media_capture.make_capture(ts_tuple[1], width, height, filename, args.vr_mode)
+    blurs: List[Frame] = [None] * total
 
-        blurriness = 1
-        avg_color = 0
+    for orig_idx, image in media_capture.iter_captures(
+            ts_seconds, desired_size[0], desired_size[1], args.vr_mode):
+        done = sum(1 for b in blurs if b is not None) + 1
+        print("Sampling... {}/{}".format(done, total), end="\r")
 
-        if not args.fast:
-            blurriness = media_capture.compute_blurriness(filename)
-            avg_color = media_capture.compute_avg_color(filename)
+        if args.fast:
+            blurriness, avg_color = 1, 0
+        else:
+            blurriness = compute_blurriness(image)
+            avg_color = compute_avg_color(image)
 
-        os.close(fd)
-        frm = Frame(
-            filename=filename,
+        blurs[orig_idx] = Frame(
+            image=image,
             blurriness=blurriness,
-            timestamp=ts_tuple[0],
-            avg_color=avg_color
+            timestamp=ts_seconds[orig_idx],
+            avg_color=avg_color,
         )
-        return frm
-
-    blurs: List[Frame] = []
-    futures = []
-
-    if args.fast:
-        # use multiple threads
-        with ThreadPoolExecutor() as executor:
-            for i, timestamp_tuple in enumerate(timestamps):
-                status = "Starting task... {}/{}".format(i + 1, args.num_samples)
-                print(status, end="\r")
-                suffix = ".jpg"  # faster processing time
-                future = executor.submit(do_capture, timestamp_tuple, desired_size[0], desired_size[1], suffix, args)
-                futures.append(future)
-            print()
-
-            for i, future in enumerate(futures):
-                status = "Sampling... {}/{}".format(i + 1, args.num_samples)
-                print(status, end="\r")
-                frame = future.result()
-                blurs += [
-                    frame
-                ]
-            print()
-    else:
-        # grab captures sequentially
-        for i, timestamp_tuple in enumerate(timestamps):
-            status = "Sampling... {}/{}".format(i + 1, args.num_samples)
-            print(status, end="\r")
-            suffix = ".png"  # lossless
-            frame = do_capture(timestamp_tuple, desired_size[0], desired_size[1], suffix, args)
-
-            blurs += [
-                frame
-            ]
-        print()
+    print()
 
     time_sorted = sorted(blurs, key=lambda x: x.timestamp)
 
@@ -1065,7 +979,7 @@ def compose_contact_sheet(
     w = 0
     frames = sorted(frames, key=lambda x: x.timestamp)
     for i, frame in enumerate(frames):
-        f = Image.open(frame.filename)
+        f = frame.image.convert("RGBA")
         f.putalpha(args.capture_alpha)
         image_capture_layer.paste(f, (w, h))
 
@@ -1185,22 +1099,6 @@ def save_image(args, image, media_info, output_path):
         return True
     except KeyError:
         return False
-
-
-def cleanup(frames, args):
-    """Delete temporary captures
-    """
-    if args.is_verbose:
-        print("Deleting {} temporary frames...".format(len(frames)))
-    for frame in frames:
-        try:
-            if args.is_verbose:
-                print("Deleting {} ...".format(frame.filename))
-            os.unlink(frame.filename)
-        except Exception as e:
-            if args.is_verbose:
-                print("[Error] Failed to delete {}".format(frame.filename))
-                print(e)
 
 
 def print_template_attributes():
@@ -1609,8 +1507,20 @@ def main():
         "--frame-type",
         type=str,
         default=DEFAULT_FRAME_TYPE,
-        help="Frame type passed to ffmpeg 'select=eq(pict_type,FRAME_TYPE)' filter. Should be one of ('I', 'B', 'P') or the special type 'key' which will use the 'select=key' filter instead.",
+        help="Frame type filter. Should be one of ('I', 'B', 'P') matched against PyAV's pict_type, or the special type 'key' which matches any keyframe.",
         dest="frame_type")
+    parser.add_argument(
+        "--hwaccel",
+        type=str,
+        default=Config.hwaccel,
+        help="PyAV hardware-acceleration device_type, e.g. 'cuda', 'qsv', 'vaapi', 'drm', 'd3d11va', 'videotoolbox', 'amf'. Disabled by default.",
+        dest="hwaccel")
+    parser.add_argument(
+        "--hwaccel-device",
+        type=str,
+        default=Config.hwaccel_device,
+        help="Optional device index/path passed to PyAV's HWAccel (e.g. '0' for cuda, '/dev/dri/renderD128' for vaapi).",
+        dest="hwaccel_device")
     parser.add_argument(
         "--interval",
         type=interval_type,
@@ -1763,7 +1673,9 @@ def process_file(path, args):
         path,
         accurate=args.is_accurate,
         skip_delay_seconds=args.accurate_delay_seconds,
-        frame_type=args.frame_type
+        frame_type=args.frame_type,
+        hwaccel=args.hwaccel,
+        hwaccel_device=args.hwaccel_device,
     )
 
     # metadata margins
@@ -1835,7 +1747,7 @@ def process_file(path, args):
         width = media_info.display_width
         args.vcs_width = x * width + (x - 1) * args.grid_horizontal_spacing
 
-    selected_frames, temp_frames = select_sharpest_images(media_info, media_capture, args)
+    selected_frames, _all_frames = select_sharpest_images(media_info, media_capture, args)
 
     print("Composing contact sheet...")
     image = compose_contact_sheet(media_info, selected_frames, args)
@@ -1847,17 +1759,16 @@ def process_file(path, args):
     if thumbnail_output_path is not None:
         os.makedirs(thumbnail_output_path, exist_ok=True)
         print("Copying thumbnails to {} ...".format(thumbnail_output_path))
+        thumbnail_ext = (args.image_format or "png").lstrip(".")
         for i, frame in enumerate(sorted(selected_frames, key=lambda x_frame: x_frame.timestamp)):
-            print(frame.filename)
-            thumbnail_file_extension = frame.filename.lower().split(".")[-1]
-            thumbnail_filename = "{filename}.{number}.{extension}".format(filename=os.path.basename(path),
-                                                                          number=str(i).zfill(4),
-                                                                          extension=thumbnail_file_extension)
+            thumbnail_filename = "{filename}.{number}.{extension}".format(
+                filename=os.path.basename(path),
+                number=str(i).zfill(4),
+                extension=thumbnail_ext,
+            )
             thumbnail_destination = os.path.join(thumbnail_output_path, thumbnail_filename)
-            shutil.copyfile(frame.filename, thumbnail_destination)
-
-    print("Cleaning up temporary files...")
-    cleanup(temp_frames, args)
+            print(thumbnail_destination)
+            frame.image.save(thumbnail_destination)
 
     if not is_save_successful:
         error_exit("Unsupported image format: %s." % (args.image_format,))

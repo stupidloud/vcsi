@@ -1,4 +1,3 @@
-import json
 import argparse
 from argparse import ArgumentTypeError
 
@@ -9,78 +8,65 @@ from vcsi.vcsi import Grid, grid_desired_size
 from vcsi.vcsi import timestamp_generator
 
 
-FFPROBE_EXAMPLE_JSON_PATH = "tests/data/bbb_ffprobe.json"
+def test_display_resolution(sample_video):
+    mi = MediaInfo(sample_video)
+    assert mi.display_width == 320
+    assert mi.display_height == 180
+    assert mi.sample_width == 320
+    assert mi.sample_height == 180
 
 
-class MediaInfoForTest(MediaInfo):
-
-    def __init__(self, json_path):
-        super(MediaInfoForTest, self).__init__(json_path)
-
-    def probe_media(self, path):
-        with open(path) as f:
-            self.ffprobe_dict = json.loads(f.read())
+def test_filename(sample_video):
+    mi = MediaInfo(sample_video)
+    assert mi.filename == "sample.mp4"
 
 
-def test_compute_display_resolution():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    assert mi.display_width == 1920
-    assert mi.display_height == 1080
+def test_duration_seconds(sample_video):
+    mi = MediaInfo(sample_video)
+    # The fixture is ~2 s; allow a tiny tolerance because container framing
+    # can round up/down slightly versus the requested duration.
+    assert 1.5 < mi.duration_seconds < 2.5
 
 
-def test_filename():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    assert mi.filename == "bbb_sunflower_1080p_60fps_normal.mp4"
+def test_pretty_duration(sample_video):
+    mi = MediaInfo(sample_video)
+    assert mi.duration in ("00:01", "00:02")
 
 
-def test_duration():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    assert mi.duration_seconds == 634.533333
+def test_size_bytes(sample_video):
+    mi = MediaInfo(sample_video)
+    assert mi.size_bytes > 0
 
 
-def test_pretty_duration():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    assert mi.duration == "10:34"
-
-
-def test_size_bytes():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    assert mi.size_bytes == 355856562
-
-
-def test_size():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    assert mi.size == "339.4 MiB"
-
-
-def test_template_attributes():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
+def test_template_attributes(sample_video):
+    mi = MediaInfo(sample_video)
     attributes = mi.template_attributes()
-    assert attributes["audio_codec"] == "mp3"
     assert attributes["video_codec"] == "h264"
+    assert attributes["audio_codec"] == "aac"
+    assert attributes["frame_rate"] == 24.0
 
 
-def test_grid_desired_size():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    x = 2
-    y = 3
+def test_grid_desired_size(sample_video):
+    mi = MediaInfo(sample_video)
+    x, y = 2, 3
     grid = Grid(x, y)
     width = 800
     hmargin = 20
     s = grid_desired_size(grid, mi, width=width, horizontal_margin=hmargin)
-    expected_width = (width - (x-1) * hmargin) / x
+    expected_width = (width - (x - 1) * hmargin) / x
 
     assert s[0] == expected_width
 
 
-def test_desired_size():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
+def test_desired_size(sample_video):
+    mi = MediaInfo(sample_video)
+    # 1280 width on a 320x180 source → 1280 * (180/320) = 720
     s = mi.desired_size(width=1280)
     assert s[1] == 720
 
 
-def test_timestamps():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
+def test_timestamps(sample_video):
+    mi = MediaInfo(sample_video)
     mi.duration_seconds = 100
     start_delay_percent = 7
     end_delay_percent = 7
@@ -100,24 +86,17 @@ def test_timestamps():
 
 
 def test_pretty_duration_centis_limit():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    mi.duration_seconds = 1.9999
-    pretty_duration = MediaInfo.pretty_duration(mi.duration_seconds, show_centis=True)
+    pretty_duration = MediaInfo.pretty_duration(1.9999, show_centis=True)
     assert pretty_duration == "00:01.99"
 
 
 def test_pretty_duration_millis_limit():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    mi.duration_seconds = 1.9999
-    pretty_duration = MediaInfo.pretty_duration(mi.duration_seconds, show_millis=True)
+    pretty_duration = MediaInfo.pretty_duration(1.9999, show_millis=True)
     assert pretty_duration == "00:01.999"
 
 
 def test_pretty_to_seconds():
     assert MediaInfo.pretty_to_seconds("1:11:11.111") == 4271.111
-
     assert MediaInfo.pretty_to_seconds("1:11:11") == 4271
-
     assert MediaInfo.pretty_to_seconds("1:01:00") == 3660
-
     pytest.raises(ArgumentTypeError, MediaInfo.pretty_to_seconds, "1:01:01:01:00")

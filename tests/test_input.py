@@ -4,7 +4,7 @@ from unittest.mock import patch, Mock, PropertyMock, MagicMock
 import pytest
 
 from vcsi.vcsi import Grid, mxn_type, Color, hex_color_type, manual_timestamps, timestamp_position_type, \
-    TimestampPosition, comma_separated_string_type, metadata_position_type, cleanup, save_image,\
+    TimestampPosition, comma_separated_string_type, metadata_position_type, save_image,\
     compute_timestamp_position, max_line_length, draw_metadata
 from vcsi import vcsi
 
@@ -110,18 +110,6 @@ def test_metadata_position_type():
     assert metadata_position_type("TOP") == "top"
 
     pytest.raises(ArgumentTypeError, metadata_position_type, "whatever")
-
-
-@patch("vcsi.vcsi.os")
-def test_cleanup(mocked_os):
-    mocked_os.unlink.side_effect = lambda x: True
-    args = Mock()
-    args.is_verbose = False
-    frames = [Mock()]
-    frames[0].filename = "frame1"
-    cleanup(frames, args)
-
-    mocked_os.unlink.assert_called_once_with("frame1")
 
 
 @patch("vcsi.vcsi.Image")
