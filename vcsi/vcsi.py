@@ -1742,12 +1742,15 @@ def process_file(path, args):
             args.grid = Grid(args.grid.x, y)
 
     # Portrait videos (phone footage etc.) waste huge horizontal space in
-    # a normal grid; double the column count so the contact sheet stays
-    # roughly landscape. Skip in --interval / --manual modes where the
-    # grid is sized to a fixed sample count.
+    # a normal grid; double the column count AND halve the row count so
+    # the contact sheet stays roughly landscape without changing the
+    # total sample budget. Needs at least 2 rows to halve cleanly; the
+    # degenerate Nx1 case is left alone. Skip in --interval / --manual
+    # modes where the grid is sized to a fixed sample count.
     if (args.interval is None and args.manual_timestamps is None
+            and args.grid.y >= 2
             and media_info.display_height > media_info.display_width):
-        args.grid = Grid(args.grid.x * 2, args.grid.y)
+        args.grid = Grid(args.grid.x * 2, args.grid.y // 2)
 
     args.num_selected = args.grid.x * args.grid.y
     if args.num_samples is None:
