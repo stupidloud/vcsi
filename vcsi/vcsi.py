@@ -114,7 +114,6 @@ DEFAULT_TIMESTAMP_VERTICAL_MARGIN = 5
 DEFAULT_IMAGE_QUALITY = 100
 DEFAULT_IMAGE_FORMAT = "jpg"
 DEFAULT_TIMESTAMP_POSITION = TimestampPosition.se
-DEFAULT_FRAME_TYPE = None
 DEFAULT_INTERVAL = None
 DEFAULT_HWACCEL = None
 DEFAULT_HWACCEL_DEVICE = None
@@ -153,7 +152,6 @@ class Config:
     quality = DEFAULT_IMAGE_QUALITY
     format = DEFAULT_IMAGE_FORMAT
     timestamp_position = DEFAULT_TIMESTAMP_POSITION
-    frame_type = DEFAULT_FRAME_TYPE
     interval = DEFAULT_INTERVAL
     hwaccel = DEFAULT_HWACCEL
     hwaccel_device = DEFAULT_HWACCEL_DEVICE
@@ -476,11 +474,10 @@ class MediaCapture(object):
     """
 
     def __init__(self, path, accurate=False, skip_delay_seconds=Config.accurate_delay_seconds,
-                 frame_type=Config.frame_type, hwaccel=None, hwaccel_device=None):
+                 hwaccel=None, hwaccel_device=None):
         self.path = path
         self.accurate = accurate
         self.skip_delay_seconds = skip_delay_seconds
-        self.frame_type = frame_type
         self.hwaccel = hwaccel
         self.hwaccel_device = hwaccel_device
 
@@ -513,16 +510,6 @@ class MediaCapture(object):
         v360.link_to(sink)
         graph.configure()
         return graph
-
-    @staticmethod
-    def _frame_matches_type(frame, frame_type):
-        if frame_type is None:
-            return True
-        if frame_type == "key":
-            return bool(frame.key_frame)
-        pict = getattr(frame, "pict_type", None)
-        name = getattr(pict, "name", str(pict) if pict is not None else "")
-        return name == frame_type
 
     # ---- capture API ----
 
@@ -574,6 +561,10 @@ class MediaCapture(object):
                 raise RuntimeError("No video stream in '%s'" % self.path)
             stream = v_streams[0]
             stream.thread_type = "AUTO"
+            # Tell libavcodec to drop non-keyframes at the decoder level:
+            # seek lands on the IDR at-or-before ts and the first frame the
+            # decoder emits is that IDR, so we avoid catching up the GOP.
+            stream.codec_context.skip_frame = "NONKEY"
 
             graph = self._build_vr_graph(stream) if vr_mode else None
 
@@ -602,27 +593,14 @@ class MediaCapture(object):
         offset = int(seek_ts / stream.time_base)
         container.seek(offset, stream=stream, backward=True, any_frame=False)
 
-        target = None
         for frame in container.decode(stream):
-            ftime = frame.time
-            if ftime is None:
+            if frame.time is None:
                 continue
-            if ftime < ts:
-                if self._frame_matches_type(frame, self.frame_type):
-                    target = frame
-                continue
-            # at-or-past the requested timestamp
-            if self._frame_matches_type(frame, self.frame_type):
-                return frame
-            # past timestamp but type mismatch: keep last viable candidate
-            if target is None:
-                target = frame
-
-        if target is None:
-            raise RuntimeError(
-                "Could not decode any frame at %.3fs in '%s'" % (ts, self.path)
-            )
-        return target
+            return frame
+        raise RuntimeError(
+            "Could not decode any keyframe near %.3fs in '%s'"
+            % (ts, self.path)
+        )
 
 
 # ---- module-level frame analyzers (work on PIL.Image directly) ----
@@ -1552,12 +1530,6 @@ def main():
         action="store_true",
         dest="list_template_attributes")
     parser.add_argument(
-        "--frame-type",
-        type=str,
-        default=DEFAULT_FRAME_TYPE,
-        help="Frame type filter. Should be one of ('I', 'B', 'P') matched against PyAV's pict_type, or the special type 'key' which matches any keyframe.",
-        dest="frame_type")
-    parser.add_argument(
         "--hwaccel",
         type=str,
         default=Config.hwaccel,
@@ -1717,7 +1689,6 @@ def process_file(path, args):
         path,
         accurate=args.is_accurate,
         skip_delay_seconds=args.accurate_delay_seconds,
-        frame_type=args.frame_type,
         hwaccel=args.hwaccel,
         hwaccel_device=args.hwaccel_device,
     )
