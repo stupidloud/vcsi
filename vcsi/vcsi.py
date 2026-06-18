@@ -1614,13 +1614,9 @@ def process_file(path, args):
 
     args = deepcopy(args)
 
-    is_url = False
-    url_path = ""
-    try:
-        _, _, url_path, _, _, _ = urlparse(path)
-        is_url = True
-    except ValueError:
-        pass
+    parsed = urlparse(path)
+    is_url = bool(parsed.scheme) and parsed.scheme != "file"
+    url_path = parsed.path if is_url else ""
 
     if not is_url and not os.path.exists(path):
         if args.ignore_errors:
