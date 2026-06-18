@@ -18,6 +18,7 @@ import configparser
 import math
 import textwrap
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from fractions import Fraction
 from glob import glob
@@ -523,24 +524,83 @@ class MediaCapture(object):
 
     # ---- capture API ----
 
+    def _pick_worker_count(self, num_items):
+        """One worker per CPU core, capped by the number of timestamps.
+
+        Each worker owns its own ``av.open`` + decoder, so memory (and, for
+        HW decode, GPU session count) scales linearly. When hwaccel sessions
+        are exhausted, PyAV's ``allow_software_fallback`` flag drops the
+        offender to software decode.
+        """
+        if num_items <= 1:
+            return 1
+        try:
+            cpu = os.cpu_count() or 1
+        except Exception:
+            cpu = 1
+        return max(1, min(cpu, num_items))
+
+    def _worker_thread_type(self, workers):
+        """Per-worker libavcodec thread mode.
+
+        When we fan out across multiple containers, force per-decoder
+        threading off so ``workers x slice_threads`` doesn't oversubscribe
+        the CPU. With a single worker, keep AUTO so 4K HEVC/VP9 still get
+        slice-level parallelism.
+        """
+        return "AUTO" if workers == 1 else "NONE"
+
     def iter_captures(self, timestamps, width, height, vr_mode=False):
         """Yield ``(original_index, PIL.Image)`` for every timestamp.
 
         Timestamps are decoded in ascending order so the demuxer makes a
         single forward pass; the original index lets the caller restore the
-        input order without re-sorting.
+        input order without re-sorting. When more than one timestamp is
+        requested, work is fanned out across a small pool of decoders so the
+        seek+decode chain (the actual bottleneck for sparse sampling) runs
+        in parallel.
         """
         if not timestamps:
             return
 
         indexed = sorted(enumerate(timestamps), key=lambda kv: kv[1])
+        workers = self._pick_worker_count(len(indexed))
+        thread_type = self._worker_thread_type(workers)
 
+        if workers == 1:
+            yield from self._iter_chunk(indexed, width, height, vr_mode,
+                                        thread_type)
+            return
+
+        # Strided assignment keeps each worker's timestamps roughly in order
+        # AND spread across the file, so seeks stay forward-biased within a
+        # worker but no worker is stuck with only the tail.
+        chunks = [indexed[i::workers] for i in range(workers)]
+        chunks = [c for c in chunks if c]
+
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            futures = [
+                pool.submit(self._collect_chunk, chunk, width, height,
+                            vr_mode, thread_type)
+                for chunk in chunks
+            ]
+            for fut in futures:
+                for item in fut.result():
+                    yield item
+
+    def _collect_chunk(self, indexed, width, height, vr_mode, thread_type):
+        # Threads can't share generators safely with the consumer, so
+        # materialize each worker's output before handing it back.
+        return list(self._iter_chunk(indexed, width, height, vr_mode,
+                                     thread_type))
+
+    def _iter_chunk(self, indexed, width, height, vr_mode, thread_type):
         with self._open_container() as container:
             v_streams = [s for s in container.streams if s.type == "video"]
             if not v_streams:
                 raise RuntimeError("No video stream in '%s'" % self.path)
             stream = v_streams[0]
-            stream.thread_type = "AUTO"
+            stream.thread_type = thread_type
 
             graph = self._build_vr_graph(stream) if vr_mode else None
 
