@@ -978,24 +978,23 @@ def compose_contact_sheet(
 
     final_image_width = width
     final_image_height = height + header_height
-    transparent = (255, 255, 255, 0)
 
+    # Single canvas instead of 5 full-size RGBA layers + 4 alpha_composite
+    # passes. Captures are pasted directly (or alpha-composited when the
+    # user set --capture-alpha); text is drawn straight onto the canvas
+    # (PIL's font AA blends against the existing pixels, identical to
+    # drawing on a transparent layer and compositing); semi-transparent
+    # timestamp rectangles use Image.alpha_composite per rect tile so the
+    # blend cost scales with the rect, not the canvas.
     image = Image.new("RGBA", (final_image_width, final_image_height), args.background_color)
-    image_capture_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-    image_header_text_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-    image_timestamp_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-    image_timestamp_text_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-
-    draw_header_text_layer = ImageDraw.Draw(image_header_text_layer)
-    draw_timestamp_layer = ImageDraw.Draw(image_timestamp_layer)
-    draw_timestamp_text_layer = ImageDraw.Draw(image_timestamp_text_layer)
+    draw = ImageDraw.Draw(image)
+    captures_opaque = args.capture_alpha >= 255
+    rect_opaque = args.timestamp_background_color.a >= 255
     h = 0
 
     def draw_metadata_helper():
-        """Draw metadata with fixed arguments
-        """
         return draw_metadata(
-            draw_header_text_layer,
+            draw,
             args,
             header_line_height=header_line_height,
             header_lines=header_lines,
@@ -1011,9 +1010,12 @@ def compose_contact_sheet(
     w = 0
     frames = sorted(frames, key=lambda x: x.timestamp)
     for i, frame in enumerate(frames):
-        f = frame.image.convert("RGBA")
-        f.putalpha(args.capture_alpha)
-        image_capture_layer.paste(f, (w, h))
+        if captures_opaque:
+            image.paste(frame.image, (w, h))
+        else:
+            f = frame.image.convert("RGBA")
+            f.putalpha(args.capture_alpha)
+            image.alpha_composite(f, dest=(w, h))
 
         # show timestamp
         if args.show_timestamp:
@@ -1043,7 +1045,6 @@ def compose_contact_sheet(
             text_height = abs(top - bottom)
             text_size = (text_width, text_height)
 
-            # draw rectangle
             rectangle_hpadding = args.timestamp_horizontal_padding
             rectangle_vpadding = args.timestamp_vertical_padding
 
@@ -1051,10 +1052,17 @@ def compose_contact_sheet(
                                                                   rectangle_hpadding, rectangle_vpadding)
 
             if not args.timestamp_border_mode:
-                draw_timestamp_layer.rectangle(
-                    [upper_left, bottom_right],
-                    fill=args.timestamp_background_color
-                )
+                if rect_opaque:
+                    draw.rectangle(
+                        [upper_left, bottom_right],
+                        fill=args.timestamp_background_color
+                    )
+                else:
+                    rect_w = bottom_right[0] - upper_left[0]
+                    rect_h = bottom_right[1] - upper_left[1]
+                    rect_tile = Image.new("RGBA", (rect_w, rect_h),
+                                          args.timestamp_background_color)
+                    image.alpha_composite(rect_tile, dest=upper_left)
             else:
                 offset_factor = args.timestamp_border_size
                 offsets = [
@@ -1074,7 +1082,7 @@ def compose_contact_sheet(
 
                 for offset in final_offsets:
                     # draw border first
-                    draw_timestamp_text_layer.text(
+                    draw.text(
                         (
                             upper_left[0] + rectangle_hpadding + offset[0],
                             upper_left[1] + rectangle_vpadding + offset[1]
@@ -1086,7 +1094,7 @@ def compose_contact_sheet(
                     )
 
             # draw timestamp
-            draw_timestamp_text_layer.text(
+            draw.text(
                 (
                     upper_left[0] + rectangle_hpadding,
                     upper_left[1] + rectangle_vpadding
@@ -1113,13 +1121,7 @@ def compose_contact_sheet(
         h -= args.grid_vertical_spacing
         h = draw_metadata_helper()
 
-    # alpha blend
-    out_image = Image.alpha_composite(image, image_capture_layer)
-    out_image = Image.alpha_composite(out_image, image_header_text_layer)
-    out_image = Image.alpha_composite(out_image, image_timestamp_layer)
-    out_image = Image.alpha_composite(out_image, image_timestamp_text_layer)
-
-    return out_image
+    return image
 
 
 def save_image(args, image, media_info, output_path):
