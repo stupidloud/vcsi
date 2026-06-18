@@ -526,20 +526,17 @@ class MediaCapture(object):
     # ---- capture API ----
 
     def _pick_worker_count(self, num_items):
-        """One worker per CPU core, capped by the number of timestamps.
+        """Always one decoder; consumer-side async drives the overlap.
 
-        Each worker owns its own ``av.open`` + decoder, so memory (and, for
-        HW decode, GPU session count) scales linearly. When hwaccel sessions
-        are exhausted, PyAV's ``allow_software_fallback`` flag drops the
-        offender to software decode.
+        Concurrent ``av.open`` on a multi-GB container thrashes the file
+        cache (12 simultaneous moov-atom reads on an 11 GB 4K VP9 stalled
+        the first-frame latency by seconds), and per-decoder thread
+        oversubscription beat the parallel-seek win on small-core hosts.
+        We keep the multi-worker path below for future experiments but
+        default to a single AUTO-threaded decoder, letting the producer
+        thread + bounded queue overlap decode with frame analysis instead.
         """
-        if num_items <= 1:
-            return 1
-        try:
-            cpu = os.cpu_count() or 1
-        except Exception:
-            cpu = 1
-        return max(1, min(cpu, num_items))
+        return 1
 
     def _worker_thread_type(self, workers):
         """Per-worker libavcodec thread mode.
@@ -568,22 +565,19 @@ class MediaCapture(object):
         workers = self._pick_worker_count(len(indexed))
         thread_type = self._worker_thread_type(workers)
 
-        if workers == 1:
-            yield from self._iter_chunk(indexed, width, height, vr_mode,
-                                        thread_type)
-            return
-
         # Strided assignment keeps each worker's timestamps roughly in order
         # AND spread across the file, so seeks stay forward-biased within a
-        # worker but no worker is stuck with only the tail.
+        # worker but no worker is stuck with only the tail. With the default
+        # single-worker policy this is just one chunk containing every item.
         chunks = [indexed[i::workers] for i in range(workers)]
         chunks = [c for c in chunks if c]
 
-        # Workers push each frame onto a shared queue as soon as it is
-        # decoded; the consumer yields whichever frame arrives first. This
-        # keeps the progress meter updating smoothly instead of in chunks
-        # the size of a worker's slice.
-        q = queue.Queue()
+        # Producer thread(s) push each decoded frame onto a bounded queue;
+        # the main thread yields frames as they arrive so the caller's
+        # per-frame work (compute_blurriness, compute_avg_color, ...) runs
+        # in parallel with the next decode. ``maxsize`` caps memory if the
+        # consumer falls behind the decoder.
+        q = queue.Queue(maxsize=max(2, 2 * len(chunks)))
         ITEM, ERROR, DONE = "item", "error", "done"
 
         def producer(chunk):
