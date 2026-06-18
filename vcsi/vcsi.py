@@ -17,6 +17,7 @@ import argparse
 import configparser
 import math
 import textwrap
+import queue
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -578,21 +579,36 @@ class MediaCapture(object):
         chunks = [indexed[i::workers] for i in range(workers)]
         chunks = [c for c in chunks if c]
 
-        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
-            futures = [
-                pool.submit(self._collect_chunk, chunk, width, height,
-                            vr_mode, thread_type)
-                for chunk in chunks
-            ]
-            for fut in futures:
-                for item in fut.result():
-                    yield item
+        # Workers push each frame onto a shared queue as soon as it is
+        # decoded; the consumer yields whichever frame arrives first. This
+        # keeps the progress meter updating smoothly instead of in chunks
+        # the size of a worker's slice.
+        q = queue.Queue()
+        ITEM, ERROR, DONE = "item", "error", "done"
 
-    def _collect_chunk(self, indexed, width, height, vr_mode, thread_type):
-        # Threads can't share generators safely with the consumer, so
-        # materialize each worker's output before handing it back.
-        return list(self._iter_chunk(indexed, width, height, vr_mode,
-                                     thread_type))
+        def producer(chunk):
+            try:
+                for item in self._iter_chunk(chunk, width, height, vr_mode,
+                                             thread_type):
+                    q.put((ITEM, item))
+            except BaseException as exc:
+                q.put((ERROR, exc))
+            finally:
+                q.put((DONE, None))
+
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            for chunk in chunks:
+                pool.submit(producer, chunk)
+
+            remaining = len(chunks)
+            while remaining > 0:
+                kind, payload = q.get()
+                if kind is ITEM:
+                    yield payload
+                elif kind is ERROR:
+                    raise payload
+                else:  # DONE
+                    remaining -= 1
 
     def _iter_chunk(self, indexed, width, height, vr_mode, thread_type):
         with self._open_container() as container:
