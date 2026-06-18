@@ -573,10 +573,16 @@ class MediaCapture(object):
                 if vr_mode:
                     graph.vpush(frame)
                     frame = graph.vpull()
-                img = frame.to_image()
-                if img.size != (width, height):
-                    img = img.resize((width, height), Image.BILINEAR)
-                yield orig_idx, img
+                # libswscale does YUV->RGB + Lanczos downscale in one pass,
+                # avoiding the 4K-RGB intermediate that a to_image + PIL
+                # BILINEAR resize would allocate.
+                rgb = frame.reformat(
+                    width=width,
+                    height=height,
+                    format="rgb24",
+                    interpolation="LANCZOS",
+                )
+                yield orig_idx, rgb.to_image()
 
     def make_captures(self, timestamps, width, height, vr_mode=False):
         """Materialize captures as a list ordered by the input timestamps."""
