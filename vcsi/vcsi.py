@@ -18,6 +18,7 @@ import configparser
 import math
 import textwrap
 import queue
+import threading
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -525,92 +526,54 @@ class MediaCapture(object):
 
     # ---- capture API ----
 
-    def _pick_worker_count(self, num_items):
-        """Always one decoder; consumer-side async drives the overlap.
-
-        Concurrent ``av.open`` on a multi-GB container thrashes the file
-        cache (12 simultaneous moov-atom reads on an 11 GB 4K VP9 stalled
-        the first-frame latency by seconds), and per-decoder thread
-        oversubscription beat the parallel-seek win on small-core hosts.
-        We keep the multi-worker path below for future experiments but
-        default to a single AUTO-threaded decoder, letting the producer
-        thread + bounded queue overlap decode with frame analysis instead.
-        """
-        return 1
-
-    def _worker_thread_type(self, workers):
-        """Per-worker libavcodec thread mode.
-
-        When we fan out across multiple containers, force per-decoder
-        threading off so ``workers x slice_threads`` doesn't oversubscribe
-        the CPU. With a single worker, keep AUTO so 4K HEVC/VP9 still get
-        slice-level parallelism.
-        """
-        return "AUTO" if workers == 1 else "NONE"
-
     def iter_captures(self, timestamps, width, height, vr_mode=False):
         """Yield ``(original_index, PIL.Image)`` for every timestamp.
 
-        Timestamps are decoded in ascending order so the demuxer makes a
-        single forward pass; the original index lets the caller restore the
-        input order without re-sorting. When more than one timestamp is
-        requested, work is fanned out across a small pool of decoders so the
-        seek+decode chain (the actual bottleneck for sparse sampling) runs
-        in parallel.
+        The decoder runs in a single background thread (AUTO-threaded
+        libavcodec internally) and pushes each frame onto a bounded queue;
+        the main thread yields frames as they arrive so the caller's
+        per-frame work overlaps with the next decode. Timestamps are
+        decoded in ascending order so the demuxer makes one forward pass.
         """
         if not timestamps:
             return
 
         indexed = sorted(enumerate(timestamps), key=lambda kv: kv[1])
-        workers = self._pick_worker_count(len(indexed))
-        thread_type = self._worker_thread_type(workers)
 
-        # Strided assignment keeps each worker's timestamps roughly in order
-        # AND spread across the file, so seeks stay forward-biased within a
-        # worker but no worker is stuck with only the tail. With the default
-        # single-worker policy this is just one chunk containing every item.
-        chunks = [indexed[i::workers] for i in range(workers)]
-        chunks = [c for c in chunks if c]
-
-        # Producer thread(s) push each decoded frame onto a bounded queue;
-        # the main thread yields frames as they arrive so the caller's
-        # per-frame work (compute_blurriness, compute_avg_color, ...) runs
-        # in parallel with the next decode. ``maxsize`` caps memory if the
-        # consumer falls behind the decoder.
-        q = queue.Queue(maxsize=max(2, 2 * len(chunks)))
+        try:
+            cpu = os.cpu_count() or 1
+        except Exception:
+            cpu = 1
+        q = queue.Queue(maxsize=max(1, cpu))
         ITEM, ERROR, DONE = "item", "error", "done"
 
-        def producer(chunk):
+        def producer():
             try:
-                for item in self._iter_chunk(chunk, width, height, vr_mode,
-                                             thread_type):
+                for item in self._iter_chunk(indexed, width, height, vr_mode):
                     q.put((ITEM, item))
             except BaseException as exc:
                 q.put((ERROR, exc))
             finally:
                 q.put((DONE, None))
 
-        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
-            for chunk in chunks:
-                pool.submit(producer, chunk)
-
-            remaining = len(chunks)
-            while remaining > 0:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(producer)
+            while True:
                 kind, payload = q.get()
                 if kind is ITEM:
                     yield payload
                 elif kind is ERROR:
                     raise payload
                 else:  # DONE
-                    remaining -= 1
+                    return
 
-    def _iter_chunk(self, indexed, width, height, vr_mode, thread_type):
+    def _iter_chunk(self, indexed, width, height, vr_mode):
         with self._open_container() as container:
             v_streams = [s for s in container.streams if s.type == "video"]
             if not v_streams:
                 raise RuntimeError("No video stream in '%s'" % self.path)
             stream = v_streams[0]
-            stream.thread_type = thread_type
+            stream.thread_type = "AUTO"
 
             graph = self._build_vr_graph(stream) if vr_mode else None
 
@@ -757,23 +720,38 @@ def select_sharpest_images(
 
     blurs: List[Frame] = [None] * total
 
-    for orig_idx, image in media_capture.iter_captures(
-            ts_seconds, desired_size[0], desired_size[1], args.vr_mode):
-        done = sum(1 for b in blurs if b is not None) + 1
-        print("Sampling... {}/{}".format(done, total), end="\r")
+    # Frame analysis (compute_blurriness / compute_avg_color) runs in a
+    # consumer pool sized to the CPU; the decoder thread inside
+    # iter_captures keeps the queue fed in parallel. PIL/NumPy release the
+    # GIL during the heavy ops, so threads (not processes) suffice.
+    try:
+        cpu = os.cpu_count() or 1
+    except Exception:
+        cpu = 1
+    consumer_count = max(1, cpu) if not args.fast else 1
+    progress_lock = threading.Lock()
+    done_counter = [0]
 
+    def process_frame(orig_idx, image):
         if args.fast:
             blurriness, avg_color = 1, 0
         else:
             blurriness = compute_blurriness(image)
             avg_color = compute_avg_color(image)
-
         blurs[orig_idx] = Frame(
             image=image,
             blurriness=blurriness,
             timestamp=ts_seconds[orig_idx],
             avg_color=avg_color,
         )
+        with progress_lock:
+            done_counter[0] += 1
+            print("Sampling... {}/{}".format(done_counter[0], total), end="\r")
+
+    with ThreadPoolExecutor(max_workers=consumer_count) as pool:
+        for orig_idx, image in media_capture.iter_captures(
+                ts_seconds, desired_size[0], desired_size[1], args.vr_mode):
+            pool.submit(process_frame, orig_idx, image)
     print()
 
     time_sorted = sorted(blurs, key=lambda x: x.timestamp)
