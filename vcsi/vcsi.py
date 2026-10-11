@@ -573,6 +573,13 @@ class MediaCapture(object):
                 if vr_mode:
                     graph.vpush(frame)
                     frame = graph.vpull()
+                # FFmpeg 8.x swscale rejects frames whose color primaries/trc
+                # are the reserved value 0 (emitted after av_seek_frame);
+                # normalize them to UNSPECIFIED (2) before conversion.
+                if frame.color_primaries == 0:
+                    frame.color_primaries = 2
+                if frame.color_trc == 0:
+                    frame.color_trc = 2
                 # libswscale does YUV->RGB + Lanczos downscale in one pass,
                 # avoiding the 4K-RGB intermediate that a to_image + PIL
                 # BILINEAR resize would allocate.
